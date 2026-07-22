@@ -3949,6 +3949,7 @@ struct DuplexPipeline {
     std::mutex  encoder_mtx;
     std::condition_variable encoder_cv;
     static constexpr size_t ENCODER_QUEUE_CAP = 16;
+    size_t encoder_queue_cap = 0;
 
     // ---------- llm ----------
     std::thread llm_thread;
@@ -3956,6 +3957,7 @@ struct DuplexPipeline {
     std::mutex  llm_mtx;
     std::condition_variable llm_cv;
     static constexpr size_t PREFILL_QUEUE_CAP = 32;
+    size_t prefill_queue_cap = 0;
 
     DuplexDecodeReq * pending_decode = nullptr;
     std::condition_variable decode_done_cv;
@@ -4060,6 +4062,10 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->use_tts = use_tts;
     ctx_omni->duplex_mode = duplex_mode;
     ctx_omni->base_output_dir = base_output_dir;  // 🔧 [多实例支持] 设置可配置的输出目录
+
+    ctx_omni->encoder_queue_cap = params->encoder_queue_cap;
+    ctx_omni->prefill_queue_cap = params->prefill_queue_cap;
+
     print_with_timestamp("media_type = %d, duplex_mode = %d, base_output_dir = %s\n", media_type, duplex_mode, base_output_dir.c_str());
     // 🔧 [对齐 Python MiniCPM-o-4_5-latest] prompt 格式
     // Python default_tts_chat_template:
@@ -9318,6 +9324,8 @@ static void duplex_start_threads(omni_context * ctx_omni, common_params * params
 
     if (ctx_omni->duplex == nullptr) {
         ctx_omni->duplex = new DuplexPipeline();
+        ctx_omni->duplex->encoder_queue_cap = ctx_omni->encoder_queue_cap;
+        ctx_omni->duplex->prefill_queue_cap = ctx_omni->prefill_queue_cap;
     }
     DuplexPipeline * dup = ctx_omni->duplex;
 
@@ -9478,7 +9486,7 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
         {
             std::unique_lock<std::mutex> lk(dup->llm_mtx);
             dup->llm_cv.wait(lk, [&]{
-                return dup->prefill_queue.size() < DuplexPipeline::PREFILL_QUEUE_CAP
+                return dup->prefill_queue.size() < dup->prefill_queue_cap>0 ? dup->prefill_queue_cap : DuplexPipeline::PREFILL_QUEUE_CAP
                     || !dup->running.load();
             });
             if (!dup->running.load()) {
@@ -10238,7 +10246,7 @@ static bool duplex_prefill(omni_context * ctx_omni,
     {
         std::unique_lock<std::mutex> lk(dup->encoder_mtx);
         dup->encoder_cv.wait(lk, [&]{
-            return dup->encoder_queue.size() < DuplexPipeline::ENCODER_QUEUE_CAP
+            return dup->encoder_queue.size() < dup->encoder_queue_cap>0?dup->encoder_queue_cap : DuplexPipeline::ENCODER_QUEUE_CAP
                 || !dup->running.load();
         });
         if (!dup->running.load()) {
