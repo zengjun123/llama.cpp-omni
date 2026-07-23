@@ -3959,6 +3959,15 @@ struct DuplexPipeline {
     static constexpr size_t PREFILL_QUEUE_CAP = 32;
     size_t prefill_queue_cap = 0;
 
+    // ---------- llm post----------
+    std::thread llm_post_thread;
+    std::queue<LLMOut *> decode_post_queue;
+    std::mutex decode_post_mtx;
+    std::condition_variable decode_post_cv;
+    std::condition_variable llmout_done_cv;
+    std::atomic<int> in_flight_decode{0};
+
+
     DuplexDecodeReq * pending_decode = nullptr;
     std::condition_variable decode_done_cv;
 
@@ -9317,6 +9326,7 @@ void t2w_thread_func(struct omni_context * ctx_omni, common_params *params) {
 static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * params);
 static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * params);
 static bool duplex_init_emb_cache(omni_context * ctx_omni, common_params * params);
+static void duplex_decode_post_func(omni_context * ctx_omni, common_params * params);
 
 // 启动 duplex 双线程；幂等。
 static void duplex_start_threads(omni_context * ctx_omni, common_params * params) {
@@ -9346,6 +9356,10 @@ static void duplex_start_threads(omni_context * ctx_omni, common_params * params
         dup->llm_thread = std::thread(duplex_llm_thread_func, ctx_omni, params);
         print_with_timestamp("Duplex: llm_thread created\n");
     }
+    if (!dup->llm_post_thread.joinable()) {
+        dup->llm_post_thread = std::thread(duplex_decode_post_func, ctx_omni, params);
+        print_with_timestamp("Duplex: llm_post_thread created\n");
+    }
 }
 
 // 停止 duplex 双线程、清理队列。omni_free 中调用。
@@ -9360,6 +9374,7 @@ static void duplex_stop_threads(omni_context * ctx_omni) {
 
     if (dup->encoder_thread.joinable()) dup->encoder_thread.join();
     if (dup->llm_thread.joinable())     dup->llm_thread.join();
+    if (dup->llm_post_thread.joinable())     dup->llm_post_thread.join();
 
     // 清理残留
     while (!dup->encoder_queue.empty()) {
@@ -9836,6 +9851,7 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
 static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                              const std::string & debug_dir, int round_idx) {
     // ---- 轮次同步（与老 stream_decode 对齐） ----
+    DuplexPipeline * dup = ctx_omni->duplex;
     if (round_idx >= 0) {
         if (ctx_omni->simplex_round_idx != round_idx) {
             print_with_timestamp("Duplex decode: sync round_idx %d -> %d\n",
@@ -10011,55 +10027,20 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
 
         il += total_tokens_generated;
 
-        // 清理 response 中的特殊结束 token
-        {
-            static const std::vector<std::string> end_tokens = {
-                "<|tts_eos|>", "</s>", "<|listen|>", "<|turn_eos|>",
-                "<|chunk_eos|>", "<|chunk_tts_eos|>"
-            };
-            for (const auto & t : end_tokens) {
-                size_t p = response.find(t);
-                if (p != std::string::npos) response = response.substr(0, p);
-            }
-            size_t speak_pos = response.find("<|speak|>");
-            while (speak_pos != std::string::npos) {
-                response.erase(speak_pos, std::string("<|speak|>").length());
-                speak_pos = response.find("<|speak|>");
-            }
-        }
 
-        // 推送到 text_queue（SSE）
-        if (!response.empty()) {
-            std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-            ctx_omni->text_queue.push_back(response);
-            ctx_omni->text_cv.notify_all();
-        }
+        LLMOut * llm_out = new LLMOut();
+        llm_out->text            = response;
+        llm_out->n_past          = ctx_omni->n_past;
+        llm_out->llm_finish      = llm_finish;
+        llm_out->debug_dir       = debug_dir;
+        llm_out->token_ids       = chunk_token_ids;
+        llm_out->hidden_states   = chunk_hidden_states;
+        llm_out->n_embd          = llm_n_embd;
+        llm_out->is_end_of_turn  = local_is_end_of_turn;
 
-        // 推送到 TTS queue
-        if (ctx_omni->use_tts && ctx_omni->tts_thread_info
-            && (!response.empty() || llm_finish))
-        {
-            LLMOut * llm_out = new LLMOut();
-            llm_out->text            = response;
-            llm_out->n_past          = ctx_omni->n_past;
-            llm_out->llm_finish      = llm_finish;
-            llm_out->debug_dir       = debug_dir;
-            llm_out->token_ids       = chunk_token_ids;
-            llm_out->hidden_states   = chunk_hidden_states;
-            llm_out->n_embd          = llm_n_embd;
-            llm_out->is_end_of_turn  = local_is_end_of_turn;
-
-            {
-                std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
-                ctx_omni->tts_thread_info->cv.wait(lock, [&]{
-                    return ctx_omni->tts_thread_info->queue.size()
-                           < (size_t)ctx_omni->tts_thread_info->MAX_QUEUE_SIZE;
-                });
-                // duplex 模式下无论 speek_done 都推送（与老 L9796 一致）
-                ctx_omni->tts_thread_info->queue.push(llm_out);
-            }
-            ctx_omni->tts_thread_info->cv.notify_all();
-        }
+        dup->in_flight_decode.fetch_add(1);
+        dup->decode_post_queue.push(llm_out);
+        dup->decode_post_cv.notify_all();
 
         if (llm_finish) break;
     }
@@ -10106,7 +10087,124 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         "[prof] llm decode n_past=%d->%d tokens=%d ms=%.1f listen=%d\n",
         n_past_dec_0, ctx_omni->n_past, ctx_omni->n_past - n_past_dec_0,
         dec_ms, (int)ctx_omni->ended_with_listen.load());
+
+    std::unique_lock<std::mutex> lk(dup->decode_post_mtx);
+    dup->llmout_done_cv.wait(lk, [&]{
+        return dup->in_flight_decode == 0
+            || !dup->running.load();
+    });
     return true;
+}
+
+static void duplex_decode_post_func(omni_context * ctx_omni, common_params * params){
+    DuplexPipeline * dup = ctx_omni->duplex;
+    /*
+    std::thread llm_post_thread;
+    std::queue<LLMOut *> decode_post_queue;
+    std::mutex decode_post_mtx;
+    std::condition_variable decode_post_cv;
+    static constexpr size_t DECODE_POST_QUEUE_CAP = 26;
+
+    while (!dup->prefill_queue.empty()) {
+        delete dup->prefill_queue.front();
+        dup->prefill_queue.pop();
+        n_dropped++;
+    }
+
+    struct LLMOut {
+        std::string text;
+        int n_past;
+        bool llm_finish = false;
+        std::string debug_dir;
+        // 添加token IDs和hidden states用于TTS条件生成
+        std::vector<llama_token> token_ids;  // LLM生成的token IDs
+        std::vector<float> hidden_states;   // LLM的hidden states (n_tokens * n_embd)
+        int n_embd = 0;  // hidden states的维度
+
+        // 🔧 [修复双工缺字问题] 该 chunk 是否是 turn 的最后一个 chunk
+        // 此状态随数据一起传递，避免全局状态 current_turn_ended 的时序问题
+        // 只有当 LLM 检测到 TURN_EOS/TTS_EOS/EOS 时才设置为 true
+        bool is_end_of_turn = false;
+    };
+    DuplexPipeline * dup = ctx_omni->duplex;
+    while (!dup->encoder_queue.empty()) {
+        delete dup->encoder_queue.front();
+        dup->encoder_queue.pop();
+    }
+    */
+    while (dup->running.load()) {
+        std::vector<LLMOut*> batch;
+        {
+            std::unique_lock<std::mutex> lk(dup->decode_post_mtx);
+            dup->decode_post_cv.wait(lk, [&]{
+                return !dup->decode_post_queue.empty() || !dup->running.load();
+            });
+            if (!dup->running.load() && dup->decode_post_queue.empty()) break;
+            batch.reserve(dup->decode_post_queue.size());
+            while (!dup->decode_post_queue.empty()) {
+                batch.push_back(dup->decode_post_queue.front());
+                dup->decode_post_queue.pop();
+            }
+        }
+
+        for (auto* llm_out : batch) {
+            std::string response = std::move(llm_out->text);
+
+            // 清理 response 中的特殊结束 token
+            {
+                static const std::vector<std::string> end_tokens = {
+                    "<|tts_eos|>", "</s>", "<|listen|>", "<|turn_eos|>",
+                    "<|chunk_eos|>", "<|chunk_tts_eos|>"
+                };
+                for (const auto & t : end_tokens) {
+                    size_t p = response.find(t);
+                    if (p != std::string::npos) response = response.substr(0, p);
+                }
+                size_t speak_pos = response.find("<|speak|>");
+                while (speak_pos != std::string::npos) {
+                    response.erase(speak_pos, std::string("<|speak|>").length());
+                    speak_pos = response.find("<|speak|>");
+                }
+            }
+
+            // 推送到 text_queue（SSE）
+            if (!response.empty()) {
+                std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
+                ctx_omni->text_queue.push_back(response);
+                ctx_omni->text_cv.notify_all();
+            }
+
+            // 推送到 TTS queue
+            if (ctx_omni->use_tts && ctx_omni->tts_thread_info
+                && (!response.empty() || llm_out->llm_finish))
+            {
+                llm_out->text            = response;
+                {
+                    std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
+                    ctx_omni->tts_thread_info->cv.wait(lock, [&]{
+                        return ctx_omni->tts_thread_info->queue.size()
+                               < (size_t)ctx_omni->tts_thread_info->MAX_QUEUE_SIZE;
+                    });
+                    // duplex 模式下无论 speek_done 都推送（与老 L9796 一致）
+                    ctx_omni->tts_thread_info->queue.push(llm_out);
+                }
+                ctx_omni->tts_thread_info->cv.notify_all();
+            } else {
+                delete llm_out;
+            }
+            dup->in_flight_decode.fetch_sub(1);
+        }
+
+         if (dup->decode_post_queue.empty()){
+            dup->llmout_done_cv.notify_all();
+         }
+    }
+
+    std::lock_guard<std::mutex> lk(dup->decode_post_mtx);
+    while (!dup->decode_post_queue.empty()) {
+        delete dup->decode_post_queue.front();
+        dup->decode_post_queue.pop();
+    }
 }
 
 // ---------------------------------------------------------------------------
