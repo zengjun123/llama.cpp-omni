@@ -10038,9 +10038,12 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         llm_out->n_embd          = llm_n_embd;
         llm_out->is_end_of_turn  = local_is_end_of_turn;
 
-        dup->in_flight_decode.fetch_add(1);
-        dup->decode_post_queue.push(llm_out);
-        dup->decode_post_cv.notify_all();
+        {
+            std::lock_guard<std::mutex> lk(dup->decode_post_mtx);
+            dup->decode_post_queue.push(llm_out);
+            dup->in_flight_decode.fetch_add(1);      // 也可放在锁内，保证与 push 的顺序一致
+            dup->decode_post_cv.notify_all();
+        }
 
         if (llm_finish) break;
     }
